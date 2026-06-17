@@ -103,10 +103,12 @@ body{font-family:var(--font-sans);background:var(--color-background-primary);col
     <div id="sheets-status-don" style="font-size:10px;margin-top:3px;min-height:13px"></div>
     <input type="file" id="fi-xlsx" accept=".xlsx,.xls" style="display:none">
   </div>
-  <div class="upload-zone" id="dz-meta" onclick="document.getElementById('fi-meta').click()">
+  <div class="upload-zone" id="dz-meta" style="cursor:default">
     <div class="up-icon"><i class="ti ti-brand-facebook"></i></div>
-    <div class="up-title">Meta 廣告成效 CSV</div>
-    <div class="up-sub" id="sub-meta">點擊或拖曳上傳</div>
+    <div class="up-title">Meta 廣告成效</div>
+    <button class="btn btn-primary" style="font-size:10px;padding:4px 10px;margin:4px auto 2px;display:flex" onclick="loadMetaFromAPI()"><i class="ti ti-brand-facebook"></i> 從 Meta 抓取</button>
+    <div class="up-sub" style="cursor:pointer;text-decoration:underline" onclick="document.getElementById('fi-meta').click()" id="sub-meta">或點擊上傳 CSV</div>
+    <div id="sheets-status-meta" style="font-size:10px;margin-top:3px;min-height:13px"></div>
     <input type="file" id="fi-meta" accept=".csv" style="display:none">
   </div>
   <div class="upload-zone" id="dz-goo" style="cursor:default">
@@ -952,10 +954,46 @@ document.addEventListener('change',function(e){
   if(e.target.id==='ad-to'){document.getElementById('g-to').value=e.target.value;renderTables();}
 });
 
+const META_AD_ACCOUNT='act_1962319981371840';
+const META_API_VER='v19.0';
+
+async function loadMetaFromAPI(){
+  const st=document.getElementById('sheets-status-meta');
+  let token=localStorage.getItem('meta_access_token')||'';
+  if(!token){token=prompt('請輸入 Meta Access Token（將儲存於瀏覽器）：');if(!token)return;localStorage.setItem('meta_access_token',token);}
+  if(st){st.textContent='載入中…';st.style.color='var(--color-text-secondary)';}
+  const today=new Date();
+  const start=new Date(today.getFullYear(),today.getMonth(),1);
+  const since=isoDate(start);const until=isoDate(today);
+  try{
+    const params=new URLSearchParams({fields:'campaign_name,adset_name,ad_name,spend,actions',level:'ad',time_increment:'1',time_range:JSON.stringify({since,until}),limit:'500',access_token:token});
+    let url=`https://graph.facebook.com/${META_API_VER}/${META_AD_ACCOUNT}/insights?${params}`;
+    const allData=[];
+    while(url){
+      const resp=await fetch(url);const json=await resp.json();
+      if(json.error){if(json.error.code===190||json.error.type==='OAuthException'){localStorage.removeItem('meta_access_token');}throw new Error(json.error.message);}
+      if(json.data)allData.push(...json.data);
+      url=json.paging?.next||null;
+    }
+    metaAdRows=allData.map(row=>{
+      const acts={};(row.actions||[]).forEach(a=>{acts[a.action_type]=parseFloat(a.value)||0;});
+      return{'分析報告開始':row.date_start,'行銷活動名稱':row.campaign_name,'廣告組合名稱':row.adset_name,'廣告名稱':row.ad_name,'花費金額 (TWD)':parseFloat(row.spend)||0,'連結點擊次數':acts['link_click']||0,'加到購物車次數':acts['omni_add_to_cart']||0,'購買次數':acts['omni_purchase']||0};
+    });
+    document.getElementById('sub-meta').textContent=`已從 Meta API 載入（${allData.length} 筆）`;
+    document.getElementById('dz-meta').classList.add('loaded');
+    if(st){st.textContent=`✓ ${allData.length} 筆資料`;st.style.color='#1D9E75';}
+    buildDailyFromAllSources();updateDateRange();if(daily.length)renderTables();
+  }catch(e){
+    if(st){st.textContent='載入失敗：'+e.message;st.style.color='#c0392b';}
+  }
+}
+
 async function reloadAllSheets(){
   const btn=document.getElementById('btn-reload');
   if(btn){btn.disabled=true;btn.innerHTML='<i class="ti ti-loader"></i> 抓取中…';}
-  await Promise.all([loadDonFromSheets(),loadGooFromSheets(),loadLineFromSheets()]);
+  const tasks=[loadDonFromSheets(),loadGooFromSheets(),loadLineFromSheets()];
+  if(localStorage.getItem('meta_access_token'))tasks.push(loadMetaFromAPI());
+  await Promise.all(tasks);
   if(btn){btn.disabled=false;btn.innerHTML='<i class="ti ti-refresh"></i> 重新抓取';}
 }
 
