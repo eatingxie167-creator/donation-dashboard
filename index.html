@@ -89,7 +89,8 @@ body{font-family:var(--font-sans);background:var(--color-background-primary);col
     <button class="btn btn-primary" onclick="document.getElementById('fi-config').click()"><i class="ti ti-settings"></i> 上傳活動設定表</button>
     <input type="file" id="fi-config" accept=".xlsx,.xls" style="display:none">
     <span id="config-tag" style="display:none" class="config-tag"><i class="ti ti-check"></i> <span id="config-name"></span></span>
-    <button class="btn" onclick="clearAll()"><i class="ti ti-refresh"></i> 清除資料</button>
+    <button class="btn btn-primary" onclick="reloadAllSheets()" id="btn-reload"><i class="ti ti-refresh"></i> 重新抓取</button>
+    <button class="btn" onclick="clearAll()"><i class="ti ti-trash"></i> 清除資料</button>
   </div>
 </div>
 
@@ -950,6 +951,16 @@ document.addEventListener('change',function(e){
   if(e.target.id==='ad-from'){document.getElementById('g-from').value=e.target.value;renderTables();}
   if(e.target.id==='ad-to'){document.getElementById('g-to').value=e.target.value;renderTables();}
 });
+
+async function reloadAllSheets(){
+  const btn=document.getElementById('btn-reload');
+  if(btn){btn.disabled=true;btn.innerHTML='<i class="ti ti-loader"></i> 抓取中…';}
+  await Promise.all([loadDonFromSheets(),loadGooFromSheets(),loadLineFromSheets()]);
+  if(btn){btn.disabled=false;btn.innerHTML='<i class="ti ti-refresh"></i> 重新抓取';}
+}
+
+// 頁面開啟自動載入
+window.addEventListener('load',()=>reloadAllSheets());
 </script>
 </body>
 </html>
