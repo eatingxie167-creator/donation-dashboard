@@ -123,11 +123,35 @@ const C_SPEND='#888780',C_AMT='#BA7517',C_CNT='#633806';
 const SKIP=['專案目標','報表格式範例'];
 const WEEKDAYS=['日','一','二','三','四','五','六'];
 
+// ⚠⚠ 廣告帳號是「兩個專案共用」的（Meta act_1962319981371840、Google customer
+//     9438435772），必須靠活動名稱分開，光靠日期已經分不開了——兒捐 2026-10-12
+//     在同一個帳號重啟，而送餐 9/22 那波還在跑。
+//       兒童資助／兒捐（本儀表板） = ..._sp_dom_2026_...
+//       溫暖送餐                   = ..._sp_dom_ot_2026_...  → 看 wv-meal-dashboard
+//     `sp_dom` 是 `sp_dom_ot` 的前綴！拿 'sp_dom' 當關鍵字會把兩個專案都撈進來，
+//     一定要帶到後面的 `_2026` 才分得開。
+const PROJECT_TOKEN='_sp_dom_2026';
+// 這一波（兒捐重啟）的起始月。預設顯示期間從這裡開始，
+// 不然一打開會從 6/01 算到今天，把上一波的花費混進這波的 ROAS。
+const DEFAULT_FROM='2026-10-01';
+
+// ⚠ Meta 原本是「活動名稱完全比對 + utm_id 白名單」，所以每換一波檔期、活動名稱
+//   變了就會整批濾掉、花費顯示 0（10/12 重啟就踩到：Oct 那支活動不在名單裡）。
+//   現在 DEFAULT_CONFIG.meta 只是 fallback，實際的 campNames / utmIds 會在 Meta API
+//   回來後由 autoConfigMeta() 依「PROJECT_TOKEN + 活動名稱後綴」自動補齊，
+//   以後新開活動不用改程式。
+const META_LABEL_RULES=[
+  {label:'Consideration VC',suffix:'_consideration_vc'},
+  {label:'Action ATC',      suffix:'_action_atc'},
+  {label:'Action Purchase', suffix:'_action_purchase'},
+  {label:'Action Donate',   suffix:'_action_donate'},
+];
+
 const DEFAULT_CONFIG={
   meta:[
     {label:'Consideration VC',campNames:['fb_paid_post_sp_dom_2026_Jun_ccf_consideration_vc'],utmIds:['120243319700390539']},
     {label:'Action ATC',campNames:['fb_paid_post_sp_dom_2026_Jun_ccf_action_atc'],utmIds:['120243319595970539']},
-    {label:'Action Purchase',campNames:['fb_paid_post_sp_dom_2026_Jun_ccf_action_purchase'],utmIds:['120243316748250539']},
+    {label:'Action Purchase',campNames:['fb_paid_post_sp_dom_2026_Jun_ccf_action_purchase','fb_paid_post_sp_dom_2026_Oct_ccf_action_purchase'],utmIds:['120243316748250539','120248312014690539']},
   ],
   google:[
     {label:'Pmax',campNames:[],campNamePattern:'pmax',utmContents:['pmax']},
@@ -142,6 +166,53 @@ const DEFAULT_CONFIG={
 let CONFIG=JSON.parse(JSON.stringify(DEFAULT_CONFIG));
 let charts=[],donWb=null,donRows=null,metaAdRows=null,gooAdRows=null,lineAdRows=null,daily=[];
 let currentAdTab='total';
+// 使用者自己上傳設定表時就不要再被 autoConfigMeta() 蓋掉（手動 > 自動）
+let metaConfigLocked=false;
+// 使用者自己調過日期了嗎？用來擋掉「非同步載入順序決定預設期間」的競態（見 updateDateRange）
+let dateUserSet=false;
+
+// Google 的活動比對用 campNamePattern（'pmax' / 'ccf_brand' / 'dgc'）模糊比對，
+// 這些字串本身完全不含專案代號，所以一定要再加 PROJECT_TOKEN 這一層；
+// 否則送餐（sp_dom_ot）的花費會被加進兒捐的 Pmax／品牌字／Demandgen，
+// ROAS 的分母跟著被墊高。資料源 wv_daily 是兩個專案混在一起的同一張表。
+function matchGooCamp(name,camp){
+  const n=String(name||'').toLowerCase();
+  if(!n.includes(PROJECT_TOKEN))return false;
+  return camp.campNamePattern?n.includes(camp.campNamePattern):(camp.campNames||[]).includes(String(name));
+}
+function matchGooAny(name){return CONFIG.google.some(c=>matchGooCamp(name,c));}
+
+// 從 Meta insights 實際回來的活動自動補齊 CONFIG.meta。
+// 只收屬於本專案（PROJECT_TOKEN）的活動；對不上任何後綴規則的活動不會被丟掉，
+// 會集中到「其他活動」一列——寧可多一列醜的，也不要靜默漏掉花費。
+// utmIds 直接用 campaign_id：捐款表的 utm_id 就是 Meta 的 campaign id
+// （已比對確認，例：Oct 活動 120248312014690539）。
+function autoConfigMeta(rows){
+  if(metaConfigLocked)return;
+  const seen=new Map();
+  rows.forEach(r=>{
+    const name=String(r['行銷活動名稱']||'');
+    if(!name.toLowerCase().includes(PROJECT_TOKEN))return;
+    if(!seen.has(name))seen.set(name,new Set());
+    const id=String(r['行銷活動ID']||'');
+    if(id)seen.get(name).add(id);
+  });
+  if(!seen.size)return;
+  const buckets=new Map();
+  [...seen.keys()].sort().forEach(name=>{
+    const n=name.toLowerCase();
+    const rule=META_LABEL_RULES.find(x=>n.includes(x.suffix));
+    const label=rule?rule.label:'其他活動';
+    if(!buckets.has(label))buckets.set(label,{label,campNames:[],utmIds:[]});
+    const b=buckets.get(label);
+    b.campNames.push(name);
+    seen.get(name).forEach(i=>{if(!b.utmIds.includes(i))b.utmIds.push(i);});
+  });
+  CONFIG.meta=META_LABEL_RULES.map(r=>r.label).concat('其他活動')
+    .filter(l=>buckets.has(l)).map(l=>buckets.get(l));
+  const other=buckets.get('其他活動');
+  if(other)console.warn('[autoConfigMeta] 這些活動對不上命名規則，已歸到「其他活動」：',other.campNames);
+}
 
 function parseConfig(wb){
   const cfg={meta:[],google:[],line:[]};
@@ -206,7 +277,7 @@ function matchLine(row){return String(row['來源參數']||'').includes('utm_sou
 function adSpendBySource(from,to,src){
   let s=0;
   if((src==='meta'||src==='total')&&metaAdRows){const ns=CONFIG.meta.flatMap(c=>c.campNames);metaAdRows.filter(r=>{const dt=r['分析報告開始']||'';return dt>=from&&dt<=to&&ns.includes(r['行銷活動名稱']);}).forEach(r=>{s+=(+r['花費金額 (TWD)']||0);});}
-  if((src==='google'||src==='total')&&gooAdRows){gooAdRows.filter(r=>{const dt=r['日期']||'';if(dt<from||dt>to)return false;const name=String(r['廣告活動']||'');return CONFIG.google.some(c=>c.campNamePattern?name.toLowerCase().includes(c.campNamePattern):(c.campNames||[]).includes(name));}).forEach(r=>{s+=numVal(r['費用']);});}
+  if((src==='google'||src==='total')&&gooAdRows){gooAdRows.filter(r=>{const dt=r['日期']||'';if(dt<from||dt>to)return false;return matchGooAny(r['廣告活動']);}).forEach(r=>{s+=numVal(r['費用']);});}
   if((src==='line'||src==='total')&&lineAdRows){lineAdRows.filter(r=>{const dt=r['_dayIso']||'';return dt>=from&&dt<=to;}).forEach(r=>{s+=numVal(r['Cost']);});}
   return s;
 }
@@ -216,7 +287,7 @@ function adByDay(iso,src,field){
   const gooField={'spend':'費用','click':'點擊','atc':'ATC-點擊月捐按鈕','purch':'Purchase-完成捐款'};
   const lineField={'spend':'Cost','click':'Clicks','atc':'AddToCart','purch':'Purchase'};
   if((src==='meta'||src==='total')&&metaAdRows){const ns=CONFIG.meta.flatMap(c=>c.campNames);metaAdRows.filter(r=>r['分析報告開始']===iso&&ns.includes(r['行銷活動名稱'])).forEach(r=>{s+=numVal(r[metaField[field]]);});}
-  if((src==='google'||src==='total')&&gooAdRows){gooAdRows.filter(r=>{if(r['日期']!==iso)return false;const name=String(r['廣告活動']||'');return CONFIG.google.some(c=>c.campNamePattern?name.toLowerCase().includes(c.campNamePattern):(c.campNames||[]).includes(name));}).forEach(r=>{s+=numVal(r[gooField[field]]);});}
+  if((src==='google'||src==='total')&&gooAdRows){gooAdRows.filter(r=>{if(r['日期']!==iso)return false;return matchGooAny(r['廣告活動']);}).forEach(r=>{s+=numVal(r[gooField[field]]);});}
   if((src==='line'||src==='total')&&lineAdRows){lineAdRows.filter(r=>r['_dayIso']===iso).forEach(r=>{s+=numVal(r[lineField[field]]);});}
   return s;
 }
@@ -227,7 +298,7 @@ function adCampByDay(iso,camp,src){
   const campNames=camp.campNames||[];
   let spend=0,click=0,atc=0,purch=0;
   if(src==='meta'&&metaAdRows){metaAdRows.filter(r=>r['分析報告開始']===iso&&campNames.includes(r['行銷活動名稱'])).forEach(r=>{spend+=numVal(r['花費金額 (TWD)']);click+=numVal(r['連結點擊次數']);atc+=numVal(r['加到購物車次數']);purch+=numVal(r['購買次數']);});}
-  if(src==='google'&&gooAdRows){gooAdRows.filter(r=>{if(r['日期']!==iso)return false;const name=String(r['廣告活動']||'');return camp.campNamePattern?name.toLowerCase().includes(camp.campNamePattern):campNames.includes(name);}).forEach(r=>{spend+=numVal(r['費用']);click+=numVal(r['點擊']);atc+=numVal(r['ATC-點擊月捐按鈕']);purch+=numVal(r['Purchase-完成捐款']);});}
+  if(src==='google'&&gooAdRows){gooAdRows.filter(r=>{if(r['日期']!==iso)return false;return matchGooCamp(r['廣告活動'],camp);}).forEach(r=>{spend+=numVal(r['費用']);click+=numVal(r['點擊']);atc+=numVal(r['ATC-點擊月捐按鈕']);purch+=numVal(r['Purchase-完成捐款']);});}
   if(src==='line'&&lineAdRows){lineAdRows.filter(r=>r['_dayIso']===iso).forEach(r=>{spend+=numVal(r['Cost']);click+=numVal(r['Clicks']);atc+=numVal(r['AddToCart']);purch+=numVal(r['Purchase']);});}
   return{spend,click,atc,purch};
 }
@@ -552,7 +623,7 @@ document.addEventListener('click',e=>{
 });
 
 function aggCampStats(src,camp,filtAd,allDonRows,campDonFilter){
-  const campKey=src==='meta'?'行銷活動名稱':'廣告活動';const ca=src==='line'?filtAd:(camp.campNamePattern?filtAd.filter(r=>String(r[campKey]||'').toLowerCase().includes(camp.campNamePattern)):filtAd.filter(r=>(camp.campNames||[]).includes(r[campKey])));
+  const campKey=src==='meta'?'行銷活動名稱':'廣告活動';const ca=src==='line'?filtAd:(src==='google'?filtAd.filter(r=>matchGooCamp(r[campKey],camp)):filtAd.filter(r=>(camp.campNames||[]).includes(r[campKey])));
   const don=allDonRows.filter(r=>campDonFilter(r,camp));
   const spend=src==='meta'?ca.reduce((s,r)=>s+(+r['花費金額 (TWD)']||0),0):src==='google'?ca.reduce((s,r)=>s+numVal(r['費用']),0):filtAd.reduce((s,r)=>s+numVal(r['Cost']),0);
   const click=src==='meta'?ca.reduce((s,r)=>s+(+r['連結點擊次數']||0),0):src==='google'?ca.reduce((s,r)=>s+numVal(r['點擊']),0):filtAd.reduce((s,r)=>s+numVal(r['Clicks']),0);
@@ -790,7 +861,7 @@ function buildDashboard(){
 
 function clearAll(){
   donWb=null;donRows=null;metaAdRows=null;gooAdRows=null;lineAdRows=null;daily=[];currentAdTab='total';
-  CONFIG=JSON.parse(JSON.stringify(DEFAULT_CONFIG));destroyCharts();
+  CONFIG=JSON.parse(JSON.stringify(DEFAULT_CONFIG));metaConfigLocked=false;dateUserSet=false;destroyCharts();
   document.getElementById('dashboard').innerHTML='';document.getElementById('date-bar').style.display='none';document.getElementById('config-tag').style.display='none';
   ['xlsx','meta','goo','line'].forEach(k=>{document.getElementById('sub-'+k).textContent='點擊或拖曳上傳';document.getElementById('dz-'+k).classList.remove('loaded');document.getElementById('fi-'+k).value='';});
   document.getElementById('fi-config').value='';
@@ -801,7 +872,7 @@ function loadConfig(file){
     const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'});
     const newCfg=parseConfig(wb);
     const hasAnySheet=wb.SheetNames.some(n=>['Meta','Google','LINE'].includes(n));
-    if(hasAnySheet){if(newCfg.meta.length)CONFIG.meta=newCfg.meta;if(newCfg.google.length)CONFIG.google=newCfg.google;if(newCfg.line.length)CONFIG.line=newCfg.line;document.getElementById('config-name').textContent=file.name;document.getElementById('config-tag').style.display='inline-flex';if(daily.length)renderTables();}
+    if(hasAnySheet){if(newCfg.meta.length){CONFIG.meta=newCfg.meta;metaConfigLocked=true;}if(newCfg.google.length)CONFIG.google=newCfg.google;if(newCfg.line.length)CONFIG.line=newCfg.line;document.getElementById('config-name').textContent=file.name;document.getElementById('config-tag').style.display='inline-flex';if(daily.length)renderTables();}
     else alert('設定表讀取失敗，請確認分頁名稱為 Meta / Google / LINE');
   };r.readAsArrayBuffer(file);
 }
@@ -838,8 +909,21 @@ function updateDateRange(){
   const gf=document.getElementById('g-from'),gt=document.getElementById('g-to');
   const prevFrom=gf.value,prevTo=gt.value;
   gf.min=mn;gf.max=mx;gt.min=mn;gt.max=mx;
-  if(!prevFrom||prevFrom<mn||prevFrom>mx)gf.value=mn;
-  if(!prevTo||prevTo<mn||prevTo>mx)gt.value=mx;
+  // 預設只顯示這一波（2026-10 重啟），但 min 仍然是資料最早日，
+  // 所以 6～7 月那一波的數據都還在、手動把起始日往前拉就看得到。
+  //
+  // ⚠ 四個資料源（捐款／Google／LINE／Meta）是各自非同步載入、每個都會呼叫
+  //   updateDateRange()，而 Meta 最慢（要翻 5 頁、十幾秒）。只靠「prevFrom 在
+  //   範圍內就保留」會變成看載入順序的賭局：捐款表先到時 mn=mx=最後一天，
+  //   日期就被釘在那天，Meta 回來後因為「還在範圍內」而不會修正，
+  //   結果預設期間變成單一天。所以改成只有「使用者自己動過」才保留。
+  if(!dateUserSet){
+    gf.value=(DEFAULT_FROM>=mn&&DEFAULT_FROM<=mx)?DEFAULT_FROM:mn;
+    gt.value=mx;
+  }else{
+    if(!prevFrom||prevFrom<mn||prevFrom>mx)gf.value=(DEFAULT_FROM>=mn&&DEFAULT_FROM<=mx)?DEFAULT_FROM:mn;
+    if(!prevTo||prevTo<mn||prevTo>mx)gt.value=mx;
+  }
   document.getElementById('date-bar').style.display='flex';
 }
 
@@ -853,42 +937,45 @@ function loadXlsx(file){
 function loadMetaCsv(file){Papa.parse(file,{header:true,skipEmptyLines:true,complete:res=>{metaAdRows=res.data;document.getElementById('sub-meta').textContent=file.name;document.getElementById('dz-meta').classList.add('loaded');buildDailyFromAllSources();updateDateRange();if(daily.length)renderTables();}});}
 function loadGooCsv(file){Papa.parse(file,{header:true,skipEmptyLines:true,beforeFirstChunk:chunk=>{const lines=chunk.split(/\r?\n/);return lines.slice(2).join('\n');},complete:res=>{gooAdRows=res.data;document.getElementById('sub-goo').textContent=file.name;document.getElementById('dz-goo').classList.add('loaded');buildDailyFromAllSources();updateDateRange();if(daily.length)renderTables();}});}
 
-const DON_SHEETS_ID='1B0ZaZwDnZx16CiCtEhqJcoQaG9LDRv3pc9Ds9rtcNZI';
+// 2026-10-13 換表：舊表 1B0ZaZwD… 是「每天一個 MMDD更新 分頁」的格式，
+// 要一天發一個 gviz 請求（開一次頁面 130+ 個請求），而且分頁名稱一旦漏掉就靜默少資料。
+// 新表把 6/01 以來的歷史與這波重啟的資料併成單一「捐款訂單」分頁，一個請求就拿完。
+const DON_SHEETS_ID='1PlACtDS0XMXgMTBDcS4PtSKLmS9P5ZLgGTG1Y5LAjoQ';
+const DON_TAB_NAME='捐款訂單';
 async function loadDonFromSheets(){
   const st=document.getElementById('sheets-status-don');
   if(st){st.textContent='載入中…';st.style.color='var(--color-text-secondary)';}
-  const today=new Date();
-  // 從365天前到今天，全部同時發請求加速載入
-  const start=new Date(2026,5,1);
-  const dates=[];
-  for(let d=new Date(start);d<=today;d.setDate(d.getDate()+1)){
-    const mm=String(d.getMonth()+1).padStart(2,'0');
-    const dd2=String(d.getDate()).padStart(2,'0');
-    dates.push(mm+dd2+'更新');
-  }
-  const fetchSheet=async(sheetName)=>{
-    try{
-      const url=`https://docs.google.com/spreadsheets/d/${DON_SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(sheetName)}`;
-      const resp=await fetch(url);
-      if(!resp.ok)return null;
-      const text=await resp.text();
-      if(!text||text.includes('Visualization: Access denied')||text.trim()==='')return null;
-      const parsed=Papa.parse(text,{header:true,skipEmptyLines:true});
-      return(parsed.data&&parsed.data.length>0)?parsed.data:null;
-    }catch(e){return null;}
-  };
-  const results=await Promise.all(dates.map(fetchSheet));
-  const allRows=[];let loaded=0;
-  results.forEach(rows=>{if(rows){allRows.push(...rows);loaded++;}});
-  if(allRows.length>0){
-    donWb=null;donRows=allRows;
+  try{
+    const url=`https://docs.google.com/spreadsheets/d/${DON_SHEETS_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(DON_TAB_NAME)}`;
+    const resp=await fetch(url);
+    if(!resp.ok)throw new Error('HTTP '+resp.status);
+    const text=await resp.text();
+    if(!text||text.includes('Visualization: Access denied'))throw new Error('無法存取試算表');
+    const parsed=Papa.parse(text,{header:true,skipEmptyLines:true});
+    const rows=(parsed.data||[]).filter(r=>String(r['訂單編號']||'').trim());
+    // ⚠ gviz 遇到不存在的分頁名稱不會報錯，會默默回傳「第一個分頁」（這份是「專案目標」）。
+    //   所以一定要驗欄位，不然分頁被改名時儀表板會安靜地吃到一張無關的表。
+    if(!rows.length)throw new Error(`找不到「${DON_TAB_NAME}」分頁或分頁是空的`);
+    if(!('訂單日期' in rows[0])||!('來源參數' in rows[0]))throw new Error(`「${DON_TAB_NAME}」分頁欄位不符`);
+    // ⚠ 客戶是用貼上的方式維護這張表，重複貼同一批是常態
+    //   （舊表 0727更新 就有同一列被貼 4 次、多算 $1,500）。
+    //   去重鍵用「訂單編號 + 捐款編號 + 捐款細項 + 捐款總額」：
+    //   訂單編號 + 捐款編號 才是真正的主鍵（一筆訂單會有多個捐款明細）。
+    const seen=new Set();const uniq=[];let dup=0;
+    rows.forEach(r=>{
+      const k=[r['訂單編號'],r['捐款編號'],r['捐款細項'],r['捐款總額']].map(v=>String(v||'').trim()).join('|');
+      if(seen.has(k)){dup++;return;}
+      seen.add(k);uniq.push(r);
+    });
+    if(dup)console.warn(`[loadDonFromSheets] 捐款表有 ${dup} 列重複，已去重`);
+    donWb=null;donRows=uniq;
     buildDailyFromAllSources();updateDateRange();
-    document.getElementById('sub-xlsx').textContent=`已從 Sheets 載入（${loaded} 天）`;
+    document.getElementById('sub-xlsx').textContent=`已從 Sheets 載入（${uniq.length} 筆${dup?`，去重 ${dup} 筆`:''}）`;
     document.getElementById('dz-xlsx').classList.add('loaded');
     buildDashboard();
-    if(st){st.textContent=`✓ 載入 ${loaded} 天資料`;st.style.color='#1D9E75';}
-  }else{
-    if(st){st.textContent='載入失敗，請用 .command 開啟儀表板';st.style.color='#c0392b';}
+    if(st){st.textContent=`✓ ${uniq.length} 筆資料${dup?`（已去重 ${dup}）`:''}`;st.style.color='#1D9E75';}
+  }catch(e){
+    if(st){st.textContent='載入失敗：'+e.message;st.style.color='#c0392b';}
   }
 }
 
@@ -905,11 +992,31 @@ async function loadGooFromSheets(){
     if(!text||text.includes('Visualization: Access denied'))throw new Error('無法存取試算表');
     Papa.parse(text,{header:true,skipEmptyLines:true,
       transformHeader:h=>{
-        const map={'Campaign Name':'廣告活動','Day':'日期','Cost':'費用','Clicks':'點擊','加入購物車':'ATC-點擊月捐按鈕','購買':'Purchase-完成捐款'};
+        const map={'Campaign Name':'廣告活動','Day':'日期','Cost':'費用','Clicks':'點擊',
+          '購買':'Purchase-完成捐款'};
         return map[h.trim()]||h.trim();
       },
       complete:res=>{
         if(!res.data||!res.data.length){if(st){st.textContent='載入失敗：無資料';st.style.color='#c0392b';}return;}
+        // ⚠ gviz 遇到不存在的分頁名稱不會報錯，會默默回傳「第一個分頁」。
+        //   沒有這道檢查的話，分頁被改名時儀表板會安靜地吃到一張完全無關的表。
+        if(!('廣告活動' in res.data[0])||!('日期' in res.data[0])){
+          if(st){st.textContent=`載入失敗：找不到「${GOO_SHEET_NAME}」分頁或欄位已改名`;st.style.color='#c0392b';}
+          return;
+        }
+        // ⚠⚠ 這個帳號的「加入購物車」轉換動作有兩個名字，而且名字跟專案對不起來：
+        //     兒童資助_加入購物車 → 幾乎不觸發（2026-06~10 整個帳號只有 9 次），
+        //                          應該是建了但沒正確埋在頁面上。
+        //     營養餐食_加入購物車 → 兩個專案真正在用的那一個（同期兒捐 2,359 次）。
+        //     光看名字會以為是「本專案 / 送餐」的拆分，實際不是——已用 Google Ads API
+        //     依活動分組查證過。舊程式只認 `加入購物車`（兩個名字都對不上），
+        //     所以 ATC 一路顯示 0 也不報錯。
+        //     每一列都已經是「單一活動 × 單一天」，在同一列加總不會混到另一個專案，
+        //     只是把同一活動被拆成兩個轉換動作的 ATC 併回來。`加入購物車` 留著給舊檔。
+        const ATC_COLS=['兒童資助_加入購物車','營養餐食_加入購物車','加入購物車'];
+        res.data.forEach(r=>{
+          r['ATC-點擊月捐按鈕']=ATC_COLS.reduce((s,c)=>s+(c in r?numVal(r[c]):0),0);
+        });
         gooAdRows=res.data;
         document.getElementById('sub-goo').textContent=`已從 Sheets 載入（${res.data.length} 筆）`;
         document.getElementById('dz-goo').classList.add('loaded');
@@ -926,12 +1033,36 @@ function loadLineXlsx(file){
     const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array',cellDates:true});
     const ws=wb.Sheets['Raw'];if(!ws){alert('找不到 Raw 分頁');return;}
     const rows=XLSX.utils.sheet_to_json(ws,{defval:''});
-    lineAdRows=rows.map(r=>{let day=r['Day'],iso='';if(day instanceof Date)iso=isoDate(day);else if(typeof day==='string'&&day.match(/\d{4}-\d{2}-\d{2}/))iso=day.substring(0,10);else if(typeof day==='number'){const d=new Date(Math.round((day-25569)*86400*1000));iso=isoDate(d);}return{...r,_dayIso:iso};});
+    lineAdRows=filterLineRows(rows.map(r=>{let day=r['Day'],iso='';if(day instanceof Date)iso=isoDate(day);else if(typeof day==='string'&&day.match(/\d{4}-\d{2}-\d{2}/))iso=day.substring(0,10);else if(typeof day==='number'){const d=new Date(Math.round((day-25569)*86400*1000));iso=isoDate(d);}return{...r,_dayIso:iso};}));
     document.getElementById('sub-line').textContent=file.name;document.getElementById('dz-line').classList.add('loaded');buildDailyFromAllSources();updateDateRange();if(daily.length)renderTables();
   };r.readAsArrayBuffer(file);
 }
 
 const LINE_SHEETS_ID='1rfHflRL2oioAKOZtN7WsF_tA2csCpN0BAhtizXnRKE8';
+
+// ⚠⚠ LINE 的 Raw 表跟 Meta／Google 一樣是「兩個專案混在同一張表」，而且這張表的
+//     ID 兩個儀表板是共用的。LINE 的活動名稱沒有 sp_dom / sp_dom_ot 可以認
+//     （長這樣：`0601_0731_311,020_5,098_PA2604367`），能分的是「廣告名稱前綴」：
+//       SP… = 兒童資助／兒捐（本專案）  例：SP01_翠屏_1080、SP33_玹玹_1200
+//       OT… = 溫暖送餐                例：OT01_便當_1080、OT11_咖哩_600
+//     實測 6,388 列可以 100% 乾淨切開（SP 5,419 列 / OT 969 列，沒有例外）：
+//       PA2604367  2026-06-01~08-27  $311,083  全部 SP  → 兒捐
+//       PA2608635  2026-10-02~10-12  $33,364   全部 OT  → 送餐（名稱帶 Nutrition）
+//     沒有這道過濾的話，兒捐看 10 月會把送餐的 LINE 花費算進來。
+//     在「載入」這一層就濾掉，lineAdRows 之後所有用到的地方（含日期軸）就都乾淨了。
+const LINE_AD_PREFIX=/^SP/i;
+function filterLineRows(rows){
+  const keep=[],drop={};
+  rows.forEach(r=>{
+    const n=String(r['Ad name']||'');
+    if(LINE_AD_PREFIX.test(n))keep.push(r);
+    else drop[String(r['Campaign name']||'(無活動名)')]=(drop[String(r['Campaign name']||'(無活動名)')]||0)+1;
+  });
+  if(Object.keys(drop).length)console.warn('[LINE] 已濾掉不屬於本專案（廣告名非 SP 開頭）的列：',drop);
+  // 全部被濾掉通常代表命名規則變了，要讓它看得見，不要安靜地變成 0
+  if(rows.length&&!keep.length)console.error('[LINE] 整張表沒有任何 SP 開頭的廣告，請確認命名規則是否改了');
+  return keep;
+}
 async function loadLineFromSheets(){
   const st=document.getElementById('sheets-status-line');
   if(st){st.textContent='載入中…';st.style.color='var(--color-text-secondary)';}
@@ -941,16 +1072,24 @@ async function loadLineFromSheets(){
     if(!resp.ok)throw new Error('HTTP '+resp.status);
     const text=await resp.text();
     if(!text||text.includes('Visualization: Access denied'))throw new Error('無法存取試算表');
-    const parsed=Papa.parse(text,{header:true,skipEmptyLines:true});
-    if(!parsed.data||!parsed.data.length)throw new Error('無資料');
-    lineAdRows=parsed.data.map(r=>{
-      const day=r['Day']||'';
-      const iso=day.match(/\d{4}-\d{2}-\d{2}/)?day.substring(0,10):'';
-      return{...r,_dayIso:iso};
-    });
-    document.getElementById('sub-line').textContent='已從 Sheets 載入';
+    // ⚠⚠ 千萬不要用 Papa 的 header:true。這張表的標題列是「23 個真欄位 + 21 個空白欄位（""）」，
+    //     Papa 在 header 模式下會判成 InvalidQuotes（實測同一份資料吐 6,389 個錯誤），
+    //     把 6,388 列吃成 6,387 列、固定少掉一列有花費的廣告。
+    //     改成 header:false 自己組物件：同一份資料 0 個錯誤、6,388 列完整。
+    const parsed=Papa.parse(text,{header:false,skipEmptyLines:true});
+    const cells=parsed.data||[];
+    if(cells.length<2)throw new Error('無資料');
+    const hdr=cells[0].map(h=>String(h||'').trim());
+    if(!hdr.includes('Cost'))throw new Error('找不到 Cost 欄位，分頁結構可能已變更');
+    lineAdRows=filterLineRows(cells.slice(1).map(row=>{
+      const o={};hdr.forEach((h,i)=>{if(h)o[h]=row[i];});
+      const day=o['Day']||'';
+      o._dayIso=day.match(/\d{4}-\d{2}-\d{2}/)?day.substring(0,10):'';
+      return o;
+    }).filter(r=>r._dayIso));
+    document.getElementById('sub-line').textContent=`已從 Sheets 載入（${lineAdRows.length} 筆）`;
     document.getElementById('dz-line').classList.add('loaded');
-    if(st){st.textContent='✓ 載入成功';st.style.color='#1D9E75';}
+    if(st){st.textContent=`✓ ${lineAdRows.length} 筆資料`;st.style.color='#1D9E75';}
     buildDailyFromAllSources();updateDateRange();if(daily.length)renderTables();
   }catch(e){
     if(st){st.textContent='載入失敗：'+e.message;st.style.color='#c0392b';}
@@ -958,16 +1097,18 @@ async function loadLineFromSheets(){
 }
 
 document.getElementById('g-from').addEventListener('change',function(){
+  dateUserSet=true;
   const adFrom=document.getElementById('ad-from');if(adFrom)adFrom.value=this.value;
   renderTables();
 });
 document.getElementById('g-to').addEventListener('change',function(){
+  dateUserSet=true;
   const adTo=document.getElementById('ad-to');if(adTo)adTo.value=this.value;
   renderTables();
 });
 document.addEventListener('change',function(e){
-  if(e.target.id==='ad-from'){document.getElementById('g-from').value=e.target.value;renderTables();}
-  if(e.target.id==='ad-to'){document.getElementById('g-to').value=e.target.value;renderTables();}
+  if(e.target.id==='ad-from'){dateUserSet=true;document.getElementById('g-from').value=e.target.value;renderTables();}
+  if(e.target.id==='ad-to'){dateUserSet=true;document.getElementById('g-to').value=e.target.value;renderTables();}
 });
 
 const META_AD_ACCOUNT='act_1962319981371840';
@@ -981,7 +1122,17 @@ async function loadMetaFromAPI(){
   const start=new Date(2026,5,1);
   const since=isoDate(start);const until=isoDate(today);
   try{
-    const params=new URLSearchParams({fields:'campaign_name,adset_name,ad_name,spend,actions',level:'ad',time_increment:'1',time_range:JSON.stringify({since,until}),limit:'500',access_token:token});
+    // campaign_id 是給 autoConfigMeta() 用的：捐款表的 utm_id 就是 Meta campaign id
+    //
+    // ⚠⚠ filtering 不只是為了分專案，它同時是「Meta 載入失敗」的解法。
+    //     這個帳號現在兩個專案一起跑，不帶 filtering 去拉 6/01 以來 level=ad +
+    //     time_increment=1 的資料量太大，Graph API 會直接回
+    //     {code:1, error_subcode:99, message:"An unknown error occurred"}
+    //     （已實測重現：不帶 filtering 第一頁就掛；帶了之後 5 頁 2,245 列正常回來）。
+    //     CONTAIN 'sp_dom_2026' 是單純字串包含，不會誤收 'sp_dom_ot_2026'（已實測）。
+    //     但 API 端的語意不保證永遠不變，所以 autoConfigMeta() 仍會在 JS 端
+    //     再用 PROJECT_TOKEN 檢查一次——API 濾是為了效能，JS 濾才是正確性的保證。
+    const params=new URLSearchParams({fields:'campaign_id,campaign_name,adset_name,ad_name,spend,actions',level:'ad',time_increment:'1',time_range:JSON.stringify({since,until}),filtering:JSON.stringify([{field:'campaign.name',operator:'CONTAIN',value:PROJECT_TOKEN.replace(/^_/,'')}]),limit:'500',access_token:token});
     let url=`https://graph.facebook.com/${META_API_VER}/${META_AD_ACCOUNT}/insights?${params}`;
     const allData=[];
     while(url){
@@ -992,8 +1143,10 @@ async function loadMetaFromAPI(){
     }
     metaAdRows=allData.map(row=>{
       const acts={};(row.actions||[]).forEach(a=>{acts[a.action_type]=parseFloat(a.value)||0;});
-      return{'分析報告開始':row.date_start,'行銷活動名稱':row.campaign_name,'廣告組合名稱':row.adset_name,'廣告名稱':row.ad_name,'花費金額 (TWD)':parseFloat(row.spend)||0,'連結點擊次數':acts['link_click']||0,'加到購物車次數':acts['omni_add_to_cart']||0,'購買次數':acts['omni_purchase']||0};
+      return{'分析報告開始':row.date_start,'行銷活動ID':row.campaign_id,'行銷活動名稱':row.campaign_name,'廣告組合名稱':row.adset_name,'廣告名稱':row.ad_name,'花費金額 (TWD)':parseFloat(row.spend)||0,'連結點擊次數':acts['link_click']||0,'加到購物車次數':acts['omni_add_to_cart']||0,'購買次數':acts['omni_purchase']||0};
     });
+    // insights 是整個帳號的（兩個專案都在），autoConfigMeta 會只挑 PROJECT_TOKEN 的活動
+    autoConfigMeta(metaAdRows);
     document.getElementById('sub-meta').textContent=`已從 Meta API 載入（${allData.length} 筆）`;
     document.getElementById('dz-meta').classList.add('loaded');
     if(st){st.textContent=`✓ ${allData.length} 筆資料`;st.style.color='#1D9E75';}
