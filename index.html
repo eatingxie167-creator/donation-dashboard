@@ -1132,7 +1132,21 @@ async function loadMetaFromAPI(){
     //     CONTAIN 'sp_dom_2026' 是單純字串包含，不會誤收 'sp_dom_ot_2026'（已實測）。
     //     但 API 端的語意不保證永遠不變，所以 autoConfigMeta() 仍會在 JS 端
     //     再用 PROJECT_TOKEN 檢查一次——API 濾是為了效能，JS 濾才是正確性的保證。
-    const params=new URLSearchParams({fields:'campaign_id,campaign_name,adset_name,ad_name,spend,actions',level:'ad',time_increment:'1',time_range:JSON.stringify({since,until}),filtering:JSON.stringify([{field:'campaign.name',operator:'CONTAIN',value:PROJECT_TOKEN.replace(/^_/,'')}]),limit:'500',access_token:token});
+    //
+    // ⚠⚠ ad.effective_status 也一定要帶，而且要把「所有」狀態都列出來。
+    //     level=ad 的 insights 預設只回傳「還存在」的廣告，被刪掉的廣告會整個
+    //     消失，但 campaign / adset 層仍然算得到它的花費——數字會憑空短少而且
+    //     不報任何錯。送餐那邊 2026-10-12 誤刪 20 支廣告再重建，當下 ad 層
+    //     $105,711 / campaign 層 $410,909，少了 $305,198。
+    //     兒捐目前沒有被刪的廣告（ad 層與 campaign 層都是 $1,036,603，已實測），
+    //     這裡是先把洞補起來，之後誰刪了廣告都不會再掉資料。
+    const AD_STATUSES=['ACTIVE','PAUSED','DELETED','ARCHIVED','PENDING_REVIEW','DISAPPROVED',
+      'PREAPPROVED','PENDING_BILLING_INFO','CAMPAIGN_PAUSED','ADSET_PAUSED','IN_PROCESS','WITH_ISSUES'];
+    const filtering=JSON.stringify([
+      {field:'campaign.name',operator:'CONTAIN',value:PROJECT_TOKEN.replace(/^_/,'')},
+      {field:'ad.effective_status',operator:'IN',value:AD_STATUSES},
+    ]);
+    const params=new URLSearchParams({fields:'campaign_id,campaign_name,adset_name,ad_name,spend,actions',level:'ad',time_increment:'1',time_range:JSON.stringify({since,until}),filtering,limit:'500',access_token:token});
     let url=`https://graph.facebook.com/${META_API_VER}/${META_AD_ACCOUNT}/insights?${params}`;
     const allData=[];
     while(url){
