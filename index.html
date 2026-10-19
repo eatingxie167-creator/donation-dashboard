@@ -270,7 +270,32 @@ function calcM(rows){
 }
 function filtDaily(){const{from,to}=getRange();return daily.filter(d=>d.isoDate>=from&&d.isoDate<=to);}
 
-function matchMeta(row,camp){const p=String(row['來源參數']||'');if(!p.includes('utm_source=facebook'))return false;return camp.utmIds.some(id=>p.includes('utm_id='+id));}
+// ⚠ 有一部分 facebook 捐款的「來源參數」整段沒有 utm_id / utm_term（其餘參數都在，
+//   wvt_ct 與 utm_content 的 TA/SP 代號跟有 utm_id 的那批完全重疊 = 同一批廣告，
+//   推測是非付費點擊時 {{campaign.id}} 沒被代換、或付款流程洗掉了網址參數）。
+//   只比 utm_id 的話這些捐款進得了「每日明細」卻進不了任何分活動的表
+//   （2026-10-01~10-18 實測：94 筆捐款裡有 42 筆、$73,600 掉在這裡），
+//   分活動的實際捐款 CPA 會被高估。
+//   退路：用 wvt_ct 前綴比對活動名稱。但**只在剛好對到一支活動時**才認列，
+//   否則同檔期多支同前綴活動（vc / atc / purchase）會把同一筆捐款重複算進每一列。
+function getWvtCt(row){const m=String(row['來源參數']||'').match(/wvt_ct=([^&]*)/);return m?m[1].trim().toLowerCase():'';}
+function metaFallbackLabel(row){
+  const ct=getWvtCt(row);
+  if(!ct)return null;
+  const hit=CONFIG.meta.filter(c=>(c.campNames||[]).some(n=>String(n).toLowerCase().startsWith(ct)));
+  return hit.length===1?hit[0].label:null;
+}
+function matchMeta(row,camp){
+  const p=String(row['來源參數']||'');
+  if(!p.includes('utm_source=facebook'))return false;
+  if(p.includes('utm_id='))return camp.utmIds.some(id=>p.includes('utm_id='+id));
+  return metaFallbackLabel(row)===camp.label;
+}
+// 多選活動用：任一選中活動對得上就算（分活動每日明細／受眾／素材共用這支，
+// 不要再各自寫一份 utm_id 比對，不然以後修規則又會漏掉其中一張表）。
+function matchMetaAny(row,selectedCamps,cfg){
+  return (cfg||CONFIG.meta).filter(c=>selectedCamps.includes(c.label)).some(c=>matchMeta(row,c));
+}
 function matchGoogle(row,camp){const p=String(row['來源參數']||'');if(!p.includes('utm_source=google'))return false;const m=p.match(/utm_content=([^&]*)/);if(!m)return false;const c=m[1].toLowerCase();return camp.utmContents.some(kw=>c.includes(kw.toLowerCase()));}
 function matchLine(row){return String(row['來源參數']||'').includes('utm_source=line');}
 
@@ -484,10 +509,7 @@ function buildAudienceTable(filtAd,allDon,selectedCamps,cfg){
     const ca=filtAd.filter(r=>selCampNames.includes(r['行銷活動名稱'])&&parseTAFromAdset(r['廣告組合名稱'])===ta);
     const don=allDon.filter(r=>{
       if(!selectedCamps.length)return false;
-      const p=String(r['來源參數']||'');
-      if(!p.includes('utm_source=facebook'))return false;
-      const inCamp=cfg.filter(c=>selectedCamps.includes(c.label)).some(c=>c.utmIds.some(id=>p.includes('utm_id='+id)));
-      return inCamp&&parseTA(getUtmContent(r))===ta;
+      return matchMetaAny(r,selectedCamps,cfg)&&parseTA(getUtmContent(r))===ta;
     });
     const spend=ca.reduce((s,r)=>s+(+r['花費金額 (TWD)']||0),0);
     const click=ca.reduce((s,r)=>s+(+r['連結點擊次數']||0),0);
@@ -517,11 +539,8 @@ function buildCreativeTable(filtAd,allDon,selectedCamps,cfg,selectedTA){
     const ca=filtAdTA.filter(r=>selCampNames.includes(r['行銷活動名稱'])&&parseSPFromAd(r['廣告名稱'])===sp);
     const don=allDon.filter(r=>{
       if(!selectedCamps.length)return false;
-      const p=String(r['來源參數']||'');
-      if(!p.includes('utm_source=facebook'))return false;
-      const inCamp=cfg.filter(c=>selectedCamps.includes(c.label)).some(c=>c.utmIds.some(id=>p.includes('utm_id='+id)));
       const uc=getUtmContent(r);
-      return inCamp&&parseSP(uc)===sp&&(selectedTA?parseTA(uc)===selectedTA:true);
+      return matchMetaAny(r,selectedCamps,cfg)&&parseSP(uc)===sp&&(selectedTA?parseTA(uc)===selectedTA:true);
     });
     const spend=ca.reduce((s,r)=>s+(+r['花費金額 (TWD)']||0),0);
     const click=ca.reduce((s,r)=>s+(+r['連結點擊次數']||0),0);
@@ -537,11 +556,7 @@ function buildSelectedCampDaily(filt,filtAd,allDon,selectedCamps,cfg){
   const selCampNames=cfg.filter(c=>selectedCamps.includes(c.label)).flatMap(c=>c.campNames);
   return filt.map(d=>{
     const ca=filtAd.filter(r=>selCampNames.includes(r['行銷活動名稱'])&&r['分析報告開始']===d.isoDate);
-    const don=d.allRows.filter(r=>{
-      const p=String(r['來源參數']||'');
-      if(!p.includes('utm_source=facebook'))return false;
-      return cfg.filter(c=>selectedCamps.includes(c.label)).some(c=>c.utmIds.some(id=>p.includes('utm_id='+id)));
-    });
+    const don=d.allRows.filter(r=>matchMetaAny(r,selectedCamps,cfg));
     const spend=ca.reduce((s,r)=>s+(+r['花費金額 (TWD)']||0),0);
     const click=ca.reduce((s,r)=>s+(+r['連結點擊次數']||0),0);
     const atc=ca.reduce((s,r)=>s+(+r['加到購物車次數']||0),0);
